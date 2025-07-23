@@ -9,9 +9,10 @@ import os
 import torch
 from transformers import (
     LlavaNextForConditionalGeneration,
-    LlavaNextProcessor,
+    AutoProcessor,
     TrainingArguments,
-    Trainer
+    Trainer,
+    BitsAndBytesConfig
 )
 from peft import LoraConfig, get_peft_model, PeftModel
 from PIL import Image
@@ -24,6 +25,46 @@ import logging
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+class CustomTrainer(Trainer):
+    """Custom Trainer that handles meta tensor issues and memory management"""
+    
+    def _move_model_to_device(self, model, device):
+        """Override to handle meta tensor issues"""
+        try:
+            return super()._move_model_to_device(model, device)
+        except NotImplementedError as e:
+            if "meta tensor" in str(e):
+                logger.info("Meta tensor detected, skipping device movement")
+                return model
+            else:
+                raise e
+    
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """Override training step with device-aware memory management"""
+        # Only do CUDA memory management if using GPU
+        if torch.cuda.is_available() and next(model.parameters()).is_cuda:
+            torch.cuda.empty_cache()
+            
+        try:
+            return super().training_step(model, inputs, num_items_in_batch)
+        except RuntimeError as e:
+            error_str = str(e).lower()
+            if torch.cuda.is_available() and ("cuda" in error_str or "memory" in error_str or "nvml" in error_str):
+                logger.warning(f"CUDA memory error during training step: {e}")
+                if next(model.parameters()).is_cuda:
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                # Try one more time after cleanup
+                try:
+                    return super().training_step(model, inputs, num_items_in_batch)
+                except RuntimeError as e2:
+                    logger.error(f"Memory error persists after cleanup: {e2}")
+                    logger.info("Consider using --no-unfreeze-vision or smaller batch size")
+                    raise e2
+            else:
+                logger.error(f"Training step failed: {e}")
+                raise e
 
 class TableExtractionDataset:
     """Dataset for table extraction training with LLaMA-based vision model."""
@@ -56,53 +97,96 @@ class TableExtractionDataset:
         # Resize image to target dimensions
         image = image.resize((self.target_width, self.target_height), Image.Resampling.LANCZOS)
         
-        # Prepare conversation with system prompt
+        # Follow the official documentation pattern for LLaVA
         conversation = [
-            {
-                "role": "system",
-                "content": self.system_prompt
-            },
             {
                 "role": "user",
                 "content": [
                     {"type": "image"},
-                    {"type": "text", "text": "Extract the table from this image and return it as an HTML table with <table>, <tr>, <td>, and <th> tags. Do not include any other text, just the HTML table."},
+                    {"type": "text", "text": "Parse the table."},
                 ],
-            }
+            },
         ]
         
-        # Process inputs with conversation template
+        # Follow the exact documentation pattern for LLaVA Next
+        # Step 1: Generate formatted text prompt from conversation
         prompt = self.processor.apply_chat_template(conversation, add_generation_prompt=True)
-        inputs = self.processor(
-            prompt,
-            image,
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.max_length,
-            padding=False,
-        )
         
-        # Remove batch dimension and ensure proper tensor setup
+        # Step 2: Process image and prompt using the documented parameter order
+        # For LLaVA Next: processor(image, prompt, return_tensors="pt")
+        inputs = self.processor(image, prompt, return_tensors="pt")
+        
+        # Debug: check the generated prompt and inputs
+        if idx == 0:  # Only log for first item to avoid spam
+            logger.info(f"Generated prompt: {prompt[:200]}...")
+            logger.info(f"Input keys: {list(inputs.keys())}")
+            for k, v in inputs.items():
+                if isinstance(v, torch.Tensor):
+                    logger.info(f"  {k}: shape={v.shape}, dtype={v.dtype}")
+                else:
+                    logger.info(f"  {k}: type={type(v)}")
+        
+        # Remove batch dimension from apply_chat_template output for dataset
         for k, v in inputs.items():
-            if isinstance(v, torch.Tensor) and v.dim() > 0:
+            if isinstance(v, torch.Tensor) and v.dim() > 0 and v.size(0) == 1:
+                # Remove the batch dimension added by apply_chat_template
                 inputs[k] = v.squeeze(0)
         
-        # Set up labels for training
+        # Set up labels for training (for language modeling, labels = input_ids)
         inputs["labels"] = inputs["input_ids"].clone().detach().long()
         
         # Ensure proper tensor types
         inputs["input_ids"] = inputs["input_ids"].long()
         inputs["attention_mask"] = inputs["attention_mask"].long()
         
+        # Make sure pixel_values are properly handled
+        if "pixel_values" in inputs:
+            inputs["pixel_values"] = inputs["pixel_values"].float()
+        
         return inputs
+
+class LlavaDataCollator:
+    """Custom data collator for LLaVA training that properly handles multimodal inputs."""
+    
+    def __init__(self, processor):
+        self.processor = processor
+    
+    def __call__(self, features):
+        # Separate different types of data
+        input_ids = [f["input_ids"] for f in features]
+        attention_mask = [f["attention_mask"] for f in features]
+        labels = [f["labels"] for f in features]
+        pixel_values = [f["pixel_values"] for f in features if "pixel_values" in f]
+        
+        # Pad sequences
+        from transformers import DataCollatorForSeq2Seq
+        collator = DataCollatorForSeq2Seq(
+            self.processor.tokenizer,
+            padding=True,
+            return_tensors="pt"
+        )
+        
+        # Collate text data
+        text_batch = collator([
+            {"input_ids": input_ids[i], "attention_mask": attention_mask[i], "labels": labels[i]}
+            for i in range(len(features))
+        ])
+        
+        # Handle pixel values
+        if pixel_values:
+            # Stack pixel values if they exist
+            text_batch["pixel_values"] = torch.stack(pixel_values)
+        
+        return text_batch
 
 def unfreeze_vision_layers(model, layers_to_unfreeze=["vision_model"]):
     """
     Unfreeze vision encoder layers beyond just LoRA.
-    This allows full fine-tuning of the image understanding components.
+    With quantized models, only LoRA adapters can be trained.
     """
     unfrozen_params = 0
     total_vision_params = 0
+    skipped_quantized = 0
     
     for name, param in model.named_parameters():
         # Check if this parameter belongs to vision components
@@ -110,27 +194,36 @@ def unfreeze_vision_layers(model, layers_to_unfreeze=["vision_model"]):
         
         if is_vision_param:
             total_vision_params += param.numel()
-            param.requires_grad = True
-            unfrozen_params += param.numel()
-            logger.info(f"Unfrozen vision parameter: {name}")
+            # Only unfreeze if parameter supports gradients (not quantized)
+            if param.dtype in [torch.float16, torch.float32, torch.bfloat16]:
+                param.requires_grad = True
+                unfrozen_params += param.numel()
+                logger.info(f"Unfrozen vision parameter: {name}")
+            else:
+                # Skip quantized parameters
+                skipped_quantized += param.numel()
+                logger.debug(f"Skipped quantized vision parameter: {name} (dtype: {param.dtype})")
         elif 'lora_' in name:
-            # Keep LoRA parameters trainable
+            # Keep LoRA parameters trainable (these are always float)
             param.requires_grad = True
             unfrozen_params += param.numel()
         else:
-            # Freeze other parameters
-            param.requires_grad = False
+            # Freeze other parameters (but check if they can be frozen)
+            if hasattr(param, 'requires_grad'):
+                param.requires_grad = False
     
     logger.info(f"Unfrozen {unfrozen_params:,} parameters out of {total_vision_params:,} vision parameters")
+    if skipped_quantized > 0:
+        logger.info(f"Skipped {skipped_quantized:,} quantized vision parameters (training via LoRA only)")
     return unfrozen_params
 
 def train_llama_table_extraction(
-            base_model_name="llava-hf/llava-v1.6-vicuna-7b-hf",
+    base_model_name="llava-hf/llava-v1.6-vicuna-7b-hf",
     output_dir="models/llama-table-extraction",
     learning_rate=1e-4,
     max_steps=1000,
     batch_size=1,
-    gradient_accumulation_steps=8,
+    gradient_accumulation_steps=64,  # Ultra high for low-memory systems
     unfreeze_vision=True,
     use_lora=True,
     lora_r=16,
@@ -162,21 +255,66 @@ def train_llama_table_extraction(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
     
-    # Load processor and model
+    # Load processor and model using AutoProcessor as shown in documentation
     logger.info("Loading processor and model...")
-    processor = LlavaNextProcessor.from_pretrained(base_model_name)
+    processor = AutoProcessor.from_pretrained(base_model_name)
     
-    # Load model with appropriate dtype
-    model = LlavaNextForConditionalGeneration.from_pretrained(
-        base_model_name,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True
-    )
+    # Load model with aggressive memory optimizations
+    
+    # Check available GPU memory
+    if torch.cuda.is_available():
+        gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        logger.info(f"Available GPU memory: {gpu_memory_gb:.1f} GB")
+        
+        if gpu_memory_gb < 2.0:
+            logger.warning(f"GPU has only {gpu_memory_gb:.1f}GB memory - falling back to CPU training")
+            device_map = "cpu"
+            use_quantization = False
+        else:
+            device_map = "auto"
+            use_quantization = True
+    else:
+        logger.info("No GPU available - using CPU")
+        gpu_memory_gb = 0.0  # Set to 0 for CPU
+        device_map = "cpu"
+        use_quantization = False
+    
+    if use_quantization:
+        # Use 4-bit quantization for larger GPU memory
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,  # Use float16 for memory efficiency
+            bnb_4bit_use_double_quant=True,
+        )
+        
+        model = LlavaNextForConditionalGeneration.from_pretrained(
+            base_model_name,
+            quantization_config=quantization_config,
+            device_map=device_map,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            torch_dtype=torch.float16,
+        )
+    else:
+        # CPU training - no quantization needed
+        logger.info("Loading model for CPU training...")
+        model = LlavaNextForConditionalGeneration.from_pretrained(
+            base_model_name,
+            device_map=device_map,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            torch_dtype=torch.float32,  # Use float32 for CPU
+        )
     
     # Prepare model for training
     model.train()
     model.config.use_cache = False
+    
+    # Clear any existing CUDA cache
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        logger.info(f"GPU memory after model loading: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
     
     # Apply LoRA if requested
     if use_lora:
@@ -188,13 +326,20 @@ def train_llama_table_extraction(
             bias="none",
             task_type="CAUSAL_LM",
             target_modules=[
-                "q_proj", "k_proj", "v_proj", "o_proj",
-                "gate_proj", "up_proj", "down_proj"
+                "q_proj", "v_proj",  # Focus on key attention modules for memory efficiency
             ]
         )
         model = get_peft_model(model, lora_config)
     
-    # Unfreeze vision layers if requested
+    # Unfreeze vision layers if requested and device has enough memory
+    if unfreeze_vision:
+        if device_map == "cpu":
+            logger.warning("Skipping vision unfreezing for CPU training (memory optimization)")
+            unfreeze_vision = False
+        elif gpu_memory_gb < 4.0:
+            logger.warning(f"Skipping vision unfreezing for low GPU memory ({gpu_memory_gb:.1f}GB)")
+            unfreeze_vision = False
+    
     if unfreeze_vision:
         logger.info("Unfreezing vision layers...")
         vision_layers = [
@@ -204,6 +349,8 @@ def train_llama_table_extraction(
         ]
         unfrozen_params = unfreeze_vision_layers(model, vision_layers)
         logger.info(f"Unfrozen {unfrozen_params:,} vision parameters")
+    else:
+        logger.info("Vision layers remain frozen - training only LoRA adapters")
     
     # Count trainable parameters
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -214,13 +361,18 @@ def train_llama_table_extraction(
     
     # Prepare dataset
     logger.info("Preparing training dataset...")
+    image_dir = os.path.join(os.path.dirname(__file__), "_images")
+    logger.info(f"Looking for images in: {image_dir}")
+    
     train_dataset = TableExtractionDataset(
-        image_dir="_images",
+        image_dir=image_dir,
         processor=processor,
-        max_length=1024
+        max_length=512  # Reduced for memory efficiency with quantized model
     )
     
-    # Training arguments
+    # Training arguments - adjust based on device
+    is_cpu_training = device_map == "cpu"
+    
     training_args = TrainingArguments(
         output_dir=output_dir,
         per_device_train_batch_size=batch_size,
@@ -228,61 +380,56 @@ def train_llama_table_extraction(
         learning_rate=learning_rate,
         max_steps=max_steps,
         warmup_steps=max_steps // 10,
-        logging_steps=10,
-        save_steps=100,
-        save_total_limit=3,
+        logging_steps=5,  # More frequent logging for monitoring
+        save_steps=max(50, max_steps // 2),  # Save more frequently for short runs
+        save_total_limit=2,  # Reduce to save disk space
         dataloader_num_workers=0,
-        bf16=True,
-        fp16=False,
-        gradient_checkpointing=False,
+        max_grad_norm=1.0,
+        # Precision settings based on device
+        bf16=False if is_cpu_training else use_quantization,  # BF16 only on GPU with quantization
+        fp16=False if is_cpu_training else not use_quantization,  # FP16 on GPU without quantization
+        gradient_checkpointing=is_cpu_training,  # Enable on CPU for memory savings
         report_to=None,
         remove_unused_columns=False,
         dataloader_pin_memory=False,
+        ddp_find_unused_parameters=False,
+        dataloader_drop_last=False,
+        # CPU-specific optimizations
+        eval_strategy="no",
     )
     
-    # Custom data collator for multimodal data
+    # Simple data collator for multimodal data
     def data_collator(features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Collate function for training data."""
-        batch = {}
+        """Simple collate function that handles both text and image data."""
+        from transformers import DataCollatorForSeq2Seq
         
-        # Get max length in this batch
-        max_length = max(len(f['input_ids']) for f in features)
+        # Use standard collator for text data
+        text_collator = DataCollatorForSeq2Seq(
+            tokenizer=processor.tokenizer,
+            padding=True,
+            return_tensors="pt",
+            label_pad_token_id=-100,
+        )
         
-        # Pad sequences to max length in batch
-        batch['input_ids'] = torch.stack([
-            torch.nn.functional.pad(
-                f['input_ids'].long(),
-                (0, max_length - len(f['input_ids'])),
-                mode='constant',
-                value=processor.tokenizer.pad_token_id
-            ) for f in features
-        ]).long()
+        # Separate text and image data
+        text_features = [
+            {k: v for k, v in f.items() if k != 'pixel_values'}
+            for f in features
+        ]
         
-        batch['attention_mask'] = torch.stack([
-            torch.nn.functional.pad(
-                f['attention_mask'].long(),
-                (0, max_length - len(f['attention_mask'])),
-                mode='constant',
-                value=0
-            ) for f in features
-        ]).long()
+        # Collate text data
+        batch = text_collator(text_features)
         
-        batch['labels'] = torch.stack([
-            torch.nn.functional.pad(
-                f['labels'].long(),
-                (0, max_length - len(f['labels'])),
-                mode='constant',
-                value=-100
-            ) for f in features
-        ]).long()
-        
-        # Add pixel values
-        batch['pixel_values'] = torch.stack([f['pixel_values'].float() for f in features])
+        # Handle pixel_values
+        pixel_values = [f['pixel_values'] for f in features if 'pixel_values' in f]
+        if pixel_values:
+            # Simple stacking - all images should have the same shape after processing
+            batch['pixel_values'] = torch.stack([pv.float() for pv in pixel_values])
         
         return batch
     
-    # Create trainer
-    trainer = Trainer(
+    # Create trainer with custom meta tensor handling
+    trainer = CustomTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,

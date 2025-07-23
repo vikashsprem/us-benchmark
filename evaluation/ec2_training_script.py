@@ -60,7 +60,7 @@ def train_on_ec2(
     output_dir="models/llama-table-extraction-ec2",
     learning_rate=1e-4,
     batch_size=1,
-    num_epochs=3,
+    max_steps=1000,
     max_length=2048,
     gradient_accumulation_steps=4,
     warmup_steps=100,
@@ -122,24 +122,10 @@ def train_on_ec2(
             output_dir=output_dir,
             learning_rate=learning_rate,
             batch_size=batch_size,
-            num_epochs=num_epochs,
-            max_length=max_length,
+            max_steps=max_steps,
             gradient_accumulation_steps=gradient_accumulation_steps,
-            warmup_steps=warmup_steps,
-            save_steps=save_steps,
-            eval_steps=eval_steps,
-            logging_steps=logging_steps,
-            use_4bit=use_4bit,
-            use_flash_attention=use_flash_attention,
-            max_grad_norm=max_grad_norm,
-            dataloader_num_workers=dataloader_num_workers,
-            remove_unused_columns=remove_unused_columns,
-            push_to_hub=push_to_hub,
-            hub_model_id=hub_model_id,
-            hub_token=hub_token,
-            resume_from_checkpoint=resume_from_checkpoint,
-            num_train_samples=num_train_samples,
-            test_run=test_run
+            unfreeze_vision=True,
+            use_lora=True
         )
         
         training_time = time.time() - start_time
@@ -169,8 +155,8 @@ def main():
                        help="Learning rate")
     parser.add_argument("--batch-size", type=int, default=1,
                        help="Training batch size")
-    parser.add_argument("--num-epochs", type=int, default=3,
-                       help="Number of training epochs")
+    parser.add_argument("--max-steps", type=int, default=1000,
+                       help="Maximum training steps")
     parser.add_argument("--max-length", type=int, default=2048,
                        help="Maximum sequence length")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4,
@@ -189,8 +175,10 @@ def main():
     # Optimization arguments
     parser.add_argument("--use-4bit", action="store_true", default=True,
                        help="Use 4-bit quantization")
-    parser.add_argument("--use-flash-attention", action="store_true", default=True,
+    parser.add_argument("--use-flash-attention", action="store_true", default=False,
                        help="Use Flash Attention 2")
+    parser.add_argument("--no-use-flash-attention", action="store_true", default=False,
+                       help="Disable Flash Attention 2")
     parser.add_argument("--dataloader-num-workers", type=int, default=4,
                        help="Number of dataloader workers")
     
@@ -214,30 +202,17 @@ def main():
     
     args = parser.parse_args()
     
+    # Handle flash attention flag
+    use_flash_attention = args.use_flash_attention and not args.no_use_flash_attention
+    
     # Start training
     train_on_ec2(
         model_name=args.model,
         output_dir=args.output_dir,
         learning_rate=args.learning_rate,
         batch_size=args.batch_size,
-        num_epochs=args.num_epochs,
-        max_length=args.max_length,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        warmup_steps=args.warmup_steps,
-        save_steps=args.save_steps,
-        eval_steps=args.eval_steps,
-        logging_steps=args.logging_steps,
-        use_4bit=args.use_4bit,
-        use_flash_attention=args.use_flash_attention,
-        max_grad_norm=args.max_grad_norm,
-        dataloader_num_workers=args.dataloader_num_workers,
-        remove_unused_columns=args.remove_unused_columns,
-        push_to_hub=args.push_to_hub,
-        hub_model_id=args.hub_model_id,
-        hub_token=args.hub_token,
-        resume_from_checkpoint=args.resume_from_checkpoint,
-        num_train_samples=args.num_train_samples,
-        test_run=args.test_run
+        max_steps=args.max_steps,
+        gradient_accumulation_steps=args.gradient_accumulation_steps
     )
 
 if __name__ == "__main__":
